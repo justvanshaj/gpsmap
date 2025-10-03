@@ -1,103 +1,216 @@
+# app.py
 import streamlit as st
-from docx import Document
-import datetime
-import os
+from streamlit.components.v1 import html
+from PIL import Image, ImageDraw, ImageFont
+import requests, io, base64, datetime
 
-# --- Replace placeholders robustly even in tables ---
-def replace_placeholders(doc, replacements):
-    import re
-    pattern = re.compile(r"{{(.*?)}}")
+st.set_page_config(page_title="Simple GPS Map Camera", layout="centered")
+st.title("Simple GPS Map Camera (Free, OSM)")
 
-    def replace_in_paragraph(paragraph):
-        full_text = "".join(run.text for run in paragraph.runs)
-        for key, val in replacements.items():
-            full_text = full_text.replace(f"{{{{{key}}}}}", str(val))
-        paragraph.clear()
-        paragraph.add_run(full_text)
+st.markdown(
+    "Upload or capture a photo, click **Fetch location** (allow the browser prompt), then click **Use detected coords** or paste coordinates into the box. Finally click **Generate** and download the stamped image."
+)
 
-    for p in doc.paragraphs:
-        if pattern.search(p.text):
-            replace_in_paragraph(p)
+# -----------------------
+# Small JS: request geolocation and write to a hidden textarea
+# -----------------------
+GEO_JS = """
+<script>
+async function getGeo(){
+  if (!navigator.geolocation){ alert('Geolocation not supported'); return; }
+  navigator.geolocation.getCurrentPosition(
+    function(pos){
+      const val = pos.coords.latitude + ',' + pos.coords.longitude;
+      // create or update a hidden textarea with id 'streamlit_geo'
+      let el = document.getElementById('streamlit_geo');
+      if(!el){
+        el = document.createElement('textarea');
+        el.id = 'streamlit_geo';
+        el.style = 'display:none';
+        document.body.appendChild(el);
+      }
+      el.value = val;
+      // also show a small visible notice for user convenience
+      let note = document.getElementById('geo_note_streamlit');
+      if(!note){
+        note = document.createElement('div');
+        note.id = 'geo_note_streamlit';
+        note.style = 'color:green; font-weight:bold; margin-top:6px';
+        document.body.appendChild(note);
+      }
+      note.innerText = 'Location detected: ' + val + ' — click "Use detected coords" in the app.';
+    },
+    function(err){ alert('Geolocation error: ' + err.message); },
+    { enableHighAccuracy: true, timeout: 10000 }
+  );
+}
+getGeo();
+</script>
+"""
 
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    if pattern.search(p.text):
-                        replace_in_paragraph(p)
+# -----------------------
+# UI: location fetch + coords input
+# -----------------------
+st.header("1) Location")
+if st.button("📍 Fetch location (browser will ask permission)"):
+    # inject JS to populate a hidden textarea on the page with coords
+    html(GEO_JS, height=0)
 
-# --- Generate DOCX ---
-def generate_docx(data, template_path="SALARY SLIP FORMAT.docx"):
-    doc = Document(template_path)
-    replace_placeholders(doc, data)
-    file_name = f"salaryslip_{data['Name'].replace(' ', '_')}_{data['Month'].replace(' ', '_')}.docx"
-    doc.save(file_name)
-    return file_name
+st.write("If browser detection works you can click **Use detected coords** to copy them into the box. Otherwise paste `lat,lon` (e.g. `24.46196,72.77045`).")
+col1, col2 = st.columns([1,1])
+with col1:
+    if st.button("Use detected coords"):
+        # This attempts to read the hidden textarea by injecting JS that sets window.name,
+        # then reading it via st.experimental_get_query_params is unreliable.
+        # A simple pragmatic approach: re-render a small JS that copies the hidden textarea into a visible text input element created on the page,
+        # then ask the user to copy it. But to keep the app simple, we will attempt a best-effort DOM-to-prompt copy:
+        COPY_JS = """
+        <script>
+        let el = document.getElementById('streamlit_geo');
+        if(el && el.value){
+          // put value into a prompt so user can copy quickly (fallback)
+          prompt('Detected coordinates (copy and paste into the app box):', el.value);
+        } else {
+          alert('No detected coordinates found — please click "Fetch location" first and allow permission.');
+        }
+        </script>
+        """
+        html(COPY_JS, height=0)
+with col2:
+    coords_text = st.text_input("Coordinates (lat,lon)", value="")
 
-# --- Streamlit App ---
-st.set_page_config(page_title="Single Salary Slip Generator", layout="centered")
-st.title("📄 Individual Salary Slip Generator")
+# parse coords
+lat = lon = None
+if coords_text:
+    try:
+        lat_s, lon_s = coords_text.split(",")
+        lat = float(lat_s.strip()); lon = float(lon_s.strip())
+    except:
+        st.error("Could not parse coordinates. Use format: lat,lon")
 
-with st.form("salary_form"):
-    st.subheader("Enter Employee Details")
+# -----------------------
+# Image upload or capture
+# -----------------------
+st.header("2) Upload or capture an image")
+uploaded = st.file_uploader("Upload an image (jpg/png)", type=["jpg","jpeg","png"])
 
-    name = st.text_input("Name")
-    designation = st.text_input("Designation")
-    department = st.text_input("Department")
-    total_days = st.number_input("Total Days", min_value=0, max_value=31)
-    working_days = st.number_input("Working Days", min_value=0, max_value=31)
-    weekly_off = st.number_input("Weekly Off", min_value=0, max_value=10)
-    festival_off = st.number_input("Festival Off", min_value=0, max_value=10)
-    paid_days = st.number_input("Paid Days", min_value=0, max_value=31)
-    base = st.number_input("Base Salary", min_value=0.0)
-    month = st.text_input("Month (e.g., July 2025)")
+# small webcam capture snippet: captures to a hidden textarea 'cam_data' that user can paste into the app using "Load captured image"
+CAM_HTML = """
+<video id="video" width="320" height="240" autoplay></video>
+<button id="snap">Capture</button>
+<canvas id="canvas" width="320" height="240" style="display:none;"></canvas>
+<script>
+navigator.mediaDevices.getUserMedia({video:true}).then(s => {document.getElementById('video').srcObject = s;}).catch(e => {});
+document.getElementById('snap').onclick = () => {
+  const c = document.getElementById('canvas'), v = document.getElementById('video');
+  c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+  const dataURL = c.toDataURL('image/jpeg');
+  let el = document.getElementById('cam_data');
+  if(!el){ el = document.createElement('textarea'); el.id='cam_data'; el.style='display:none'; document.body.appendChild(el); }
+  el.value = dataURL;
+  alert('Captured. Click "Load captured image" in the app and paste the dataURL if needed.');
+};
+</script>
+"""
+html(CAM_HTML, height=260)
 
-    salary = st.number_input("Salary", min_value=0.0)
-    bonus = st.number_input("Bonus", min_value=0.0)
-    other = st.number_input("Other", min_value=0.0)
-    esi = st.number_input("ESI Deduction", min_value=0.0)
-    advance_till = st.number_input("Advance Till Date", min_value=0.0)
-    advance_deduct = st.number_input("Advance Deducted This Month", min_value=0.0)
-    misc = st.number_input("MISC Deduction", min_value=0.0)
+if st.button("Load captured image"):
+    dataurl = st.text_area("If capture didn't auto-load, paste dataURL from page here")
+    if dataurl:
+        try:
+            header, encoded = dataurl.split(",", 1)
+            uploaded = io.BytesIO(base64.b64decode(encoded))
+        except:
+            st.error("Invalid dataURL")
 
-    submitted = st.form_submit_button("Generate Salary Slip")
+# -----------------------
+# Generate & download
+# -----------------------
+st.header("3) Generate stamped image")
+if st.button("Generate"):
+    if not uploaded:
+        st.error("Please upload or capture an image first.")
+    elif lat is None or lon is None:
+        st.error("Please provide coordinates (paste or use detected coords).")
+    else:
+        # Open image
+        try:
+            img = Image.open(uploaded).convert("RGB")
+        except Exception as e:
+            st.error(f"Could not open image: {e}")
+            st.stop()
 
-if submitted:
-    total = salary + bonus + other
-    net_advance = advance_till - advance_deduct
-    payable = total - (esi + advance_deduct + misc)
-    payment_date = datetime.datetime.now().strftime("%d %B %Y")
+        # Reverse geocode (Nominatim)
+        address = ""
+        try:
+            r = requests.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"format": "jsonv2", "lat": lat, "lon": lon},
+                headers={"User-Agent": "Simple-GPS-Map-Camera/1.0"},
+                timeout=8,
+            )
+            address = r.json().get("display_name", "")
+        except:
+            address = ""
 
-    data = {
-        "Name": name,
-        "Designation": designation,
-        "Department": department,
-        "Total_Days": total_days,
-        "Working_Days": working_days,
-        "Weekly_Off": weekly_off,
-        "Festival_Off": festival_off,
-        "Paid_Days": paid_days,
-        "Base": base,
-        "Month": month,
-        "Salary": salary,
-        "Bonus": bonus,
-        "Other": other,
-        "Total": total,
-        "ESI": esi,
-        "Advance_Till_Date": advance_till,
-        "Advance_Deduct": advance_deduct,
-        "Net_Advance": net_advance,
-        "MISC": misc,
-        "Payable": payable,
-        "Payment_Date": payment_date,
-    }
+        # Fetch small static OSM map
+        map_img = None
+        try:
+            map_url = f"https://staticmap.openstreetmap.de/staticmap.php?center={lat},{lon}&zoom=16&size=160x160&markers={lat},{lon},red-pushpin"
+            rr = requests.get(map_url, timeout=8)
+            map_img = Image.open(io.BytesIO(rr.content)).convert("RGBA")
+        except:
+            map_img = None
 
-    docx_path = generate_docx(data)
+        # Prepare drawing
+        W, H = img.size
+        out = img.convert("RGBA")
+        draw = ImageDraw.Draw(out)
 
-    with open(docx_path, "rb") as f:
-        st.download_button(
-            label="📄 Download Salary Slip",
-            data=f,
-            file_name=os.path.basename(docx_path),
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        # Fonts (fallback to default)
+        try:
+            font_big = ImageFont.truetype("DejaVuSans-Bold.ttf", max(20, W//30))
+            font_small = ImageFont.truetype("DejaVuSans.ttf", max(14, W//55))
+        except:
+            font_big = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+
+        # Compose texts
+        now = datetime.datetime.now().strftime("%d/%m/%Y %I:%M %p")
+        title = address if address else f"Lat {lat:.6f}, Lon {lon:.6f}"
+        subtitle = f"Lat {lat:.6f}  Lon {lon:.6f}\n{now}"
+
+        # Draw translucent box at bottom
+        box_h = int(H * 0.22)
+        overlay = Image.new("RGBA", out.size, (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        od.rectangle([0, H - box_h, W, H], fill=(0, 0, 0, 180))
+        out = Image.alpha_composite(out, overlay)
+        draw = ImageDraw.Draw(out)
+
+        # Draw title
+        padding = 18
+        draw.text((padding, H - box_h + padding), title, font=font_big, fill=(255, 255, 255, 255))
+        # Draw subtitle (two lines)
+        y_sub = H - box_h + padding + (font_big.getsize(title)[1] + 8)
+        for i, line in enumerate(subtitle.split("\n")):
+            draw.text((padding, y_sub + i * (font_small.getsize(line)[1] + 4)), line, font=font_small, fill=(230, 230, 230, 255))
+
+        # Paste map inset bottom-left (overlapping box) if available
+        if map_img:
+            thumb_w, thumb_h = map_img.size
+            border = 4
+            bg = Image.new("RGBA", (thumb_w + border*2, thumb_h + border*2), (255, 255, 255, 255))
+            bg.paste(map_img, (border, border), map_img)
+            map_x = 12
+            map_y = H - box_h - thumb_h//2
+            out.paste(bg, (map_x, map_y), bg)
+
+        final = out.convert("RGB")
+
+        # Output & download link
+        st.image(final, caption="Stamped image", use_column_width=True)
+        buf = io.BytesIO()
+        final.save(buf, format="JPEG", quality=92)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        st.markdown(f'<a href="data:file/jpg;base64,{b64}" download="stamped.jpg">⬇️ Download stamped image</a>', unsafe_allow_html=True)
